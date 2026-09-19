@@ -1,40 +1,30 @@
 # Cross-Cloud Migration: Azure VM → AWS EC2 (AWS MGN)
 
-A hands-on migration project: a real workload running on an Azure VM, migrated to
-AWS EC2 using **AWS Application Migration Service (MGN)** — the same rehost
-("lift-and-shift") pattern used for on-prem-to-cloud and cloud-to-cloud migrations.
+This is a real migration, not just infra standup. I had a workload running on an
+Azure VM and moved it to AWS EC2 using AWS Application Migration Service (MGN) -
+basically the "lift and shift" pattern you'd use for an on-prem-to-cloud or
+cloud-to-cloud move.
 
-Terraform provisions everything that *can* be automated (the source workload, and
-the target networking). The actual replication, test, and cutover steps are
-documented here as a real migration runbook, because that's the part of a
-migration project that interviewers actually want to hear you walk through.
+Terraform handles the parts that make sense to automate: the source VM and the
+target-side networking. The replication, testing, and cutover steps I left as a
+manual runbook below, because that's genuinely how you'd want to run a real
+migration - and it's also the part people actually ask about in interviews, not
+the Terraform.
 
----
+## Why this looks different from a normal "spin up infra" repo
 
-## Why this is structured differently from my other projects
+Most of my other projects are "build something new." This one isn't. You're
+moving a live workload, you want minimal downtime, and you need a way back out if
+something breaks. MGN is agent-based, and a few steps here (installing the agent,
+triggering cutover) are manual on purpose - those are the moments you want a
+person looking at the screen, not a script firing on its own.
 
-Most infrastructure work is "stand up something new." Migration is different: you're
-moving a **live workload** with **minimal downtime** and a **rollback plan** in case
-something goes wrong. AWS MGN is agent-based — some steps (installing the replication
-agent, triggering cutover) are deliberately manual, because they're supposed to be
-deliberate, reviewed actions, not something you'd want fully automated in a script
-that could fire without a human checking first.
+## Which migration strategy is this (the "6 R's")
 
-## The migration framework (the "6 R's")
-
-This project demonstrates a **rehost** — the fastest of the standard cloud migration
-strategies:
-
-| Strategy | What it means | Used here? |
-|---|---|---|
-| **Rehost** | "Lift and shift" — move as-is, minimal changes | ✅ this project |
-| Replatform | Move with small optimizations (e.g., swap to managed DB) | — |
-| Refactor | Re-architect for cloud-native (e.g., containers, serverless) | — |
-| Repurchase | Replace with a SaaS equivalent | — |
-| Retain | Leave it where it is | — |
-| Retire | Decommission entirely | — |
-
----
+This is a rehost - lift and shift, move it as-is. It's the fastest of the six
+standard strategies (replatform, refactor, repurchase, retain, retire being the
+others), and it's usually the right starting point when the goal is "get off this
+platform" rather than "redesign the app while we're at it."
 
 ## Architecture
 
@@ -53,57 +43,79 @@ strategies:
                                                   └──────────────────────────┘
 ```
 
-## What this demonstrates
+## What's actually in this repo
 
-- Understanding and articulating cloud migration strategy (the 6 R's)
-- Setting up the networking a migration tool needs before replication can start
-- Working with an agent-based, continuously-replicating migration service (MGN)
-- Writing a real cutover plan with validation and rollback — not just "click migrate"
-- Cross-cloud Terraform (Azure source infra + AWS target infra in one config)
+- Terraform for both sides - the Azure source VM and the AWS VPC/subnets/security
+  groups MGN needs
+- A real runbook for replication, testing, validation, and cutover
+- A script to check network reachability before you even start the agent install,
+  because half the MGN issues I've run into trace back to a blocked port, not MGN
+  itself
+- A validation script that diffs source vs. target content before you commit to
+  cutover
+- A rollback plan that isn't just "destroy everything and hope"
 
 ## Tech stack
 
-Terraform · Azure (VM, VNet) · AWS (VPC, EC2, MGN) · AWS Application Migration Service
+Terraform, Azure (VM, VNet), AWS (VPC, EC2, MGN), AWS Application Migration
+Service, and a couple of small Python scripts for the validation/readiness checks.
 
 ---
 
 ## Prerequisites
 
 - Terraform >= 1.5.0
-- Azure CLI authenticated (`az login`)
-- AWS CLI authenticated (`aws configure`)
-- An SSH key pair (`ssh-keygen` if you don't have one) for the Azure VM
+- Azure CLI logged in (`az login`)
+- AWS CLI configured (`aws configure`)
+- An SSH key pair for the Azure VM (`ssh-keygen` if you don't already have one)
 
 ---
 
-## Part 1 — Provision the source and target infrastructure
+## Part 1 - Provision the source and target infra
 
 ```bash
 git clone https://github.com/JSR-codes/azure-to-aws-vm-migration.git
 cd azure-to-aws-vm-migration
 
 cp terraform.tfvars.example terraform.tfvars
-# edit terraform.tfvars: azure_subscription_id and my_ip are required
+# edit terraform.tfvars - azure_subscription_id and my_ip are required
 
 terraform init
 terraform plan
 terraform apply
 ```
 
-This creates the Azure source VM (running nginx, simulating a real workload) and the
-AWS-side VPC/subnets/security groups MGN needs to land replicated data.
+This stands up the Azure source VM (running nginx, standing in for a real
+workload) and the AWS side - VPC, subnets, security groups - that MGN needs to
+land replicated data.
 
-## Part 2 — Initialize AWS MGN (one-time, per AWS account/region)
+## Part 1.5 - Check network readiness before you touch the agent
+
+Don't skip this. Before installing the replication agent, make sure the source VM
+can actually reach what MGN needs on the AWS side - port 443 for the API, port
+1500 for replication traffic. If an NSG rule or a route is wrong, the agent
+install will look totally fine and replication will just sit at 0% with no
+obvious reason why. I've lost time to this exact thing before, hence the script.
+
+```bash
+ssh azureuser@<azure_source_vm_public_ip>
+python3 scripts/check_network_readiness.py <aws_endpoint_or_ip>
+```
+
+If anything comes back FAIL, fix it before moving to Part 3.
+
+## Part 2 - Initialize AWS MGN (one-time per account/region)
 
 ```bash
 aws mgn initialize-service --region us-east-1
 ```
 
-## Part 3 — Install the replication agent on the source VM
+## Part 3 - Install the replication agent on the source VM
 
-SSH into the Azure VM using the `azure_source_vm_public_ip` output, then run the
-agent installer (get the current command from the MGN console: **Source servers →
-Add source server**, or the [official docs](https://docs.aws.amazon.com/mgn/latest/ug/installing-the-agent.html)):
+SSH into the Azure VM (use the `azure_source_vm_public_ip` output), then grab the
+current install command from the MGN console - **Source servers → Add source
+server** - or the [official docs](https://docs.aws.amazon.com/mgn/latest/ug/installing-the-agent.html).
+It looks roughly like this:
 
 ```bash
 ssh azureuser@<azure_source_vm_public_ip>
@@ -116,54 +128,55 @@ sudo python3 aws-replication-installer-init.py \
   --no-prompt
 ```
 
-Once the agent connects, the source server appears in the MGN console and continuous
-replication (CDC) into the staging subnet begins automatically.
+Once it connects, the source server shows up in the MGN console and continuous
+replication into the staging subnet starts on its own.
 
-## Part 4 — Launch a test instance
+## Part 4 - Launch a test instance
 
-In the MGN console, once replication reaches 100%: select the source server →
-**Launch test instance**. This boots a copy in your AWS target subnet **without**
-affecting the still-running Azure source — this is your safety net.
+Once replication hits 100% in the console, pick the source server and choose
+**Launch test instance**. This spins up a copy in your AWS target subnet without
+touching the still-running Azure source - it's your safety net before you
+commit to anything.
 
-## Part 5 — Validate before cutover
+## Part 5 - Validate before you cut over
 
 ```bash
 python3 scripts/validate_migration.py <azure_source_ip> <test_instance_ip>
 ```
 
-This compares the actual served content between source and target. Don't proceed to
-cutover on a MISMATCH — investigate first.
+This just hashes and compares what each side actually serves. If you get a
+MISMATCH, stop and figure out why before going anywhere near cutover.
 
-## Part 6 — Cutover
+## Part 6 - Cutover
 
-In the MGN console: select the source server → **Launch cutover instance**. This is
-the point of no return for this exercise — it's the equivalent of pointing production
-traffic at the new instance. In a real migration, this step is where you'd update DNS,
-load balancer targets, or connection strings to point at the new AWS instance.
+Back in the MGN console: source server → **Launch cutover instance**. This is the
+point of no return for the exercise - equivalent to pointing real production
+traffic at the new instance. In an actual migration this is where DNS, load
+balancer targets, or connection strings would get repointed.
 
-## Part 7 — Decommission the source (only after validating cutover)
+## Part 7 - Decommission the source
 
-Once you've confirmed the cutover instance is healthy and serving correctly for a
+Only after you've confirmed the cutover instance has been healthy for a
 reasonable soak period:
 
 ```bash
 terraform destroy -target=azurerm_linux_virtual_machine.source
 ```
 
-(Or destroy everything once you're done with the whole exercise — see Cleanup below.)
+Or just tear the whole thing down once you're done - see Cleanup below.
 
 ---
 
 ## Rollback plan
 
-If validation fails or something looks wrong post-cutover:
-- The Azure source VM is **untouched** until you explicitly destroy it — it keeps
-  running as your fallback.
-- Point traffic back at the Azure source's IP/DNS.
-- Investigate the MGN replication logs and re-attempt cutover once resolved.
+If something looks off after cutover:
+- The Azure VM is left alone until you explicitly destroy it, so it's still there
+  as a fallback
+- Point traffic back at the Azure source's IP/DNS
+- Check the MGN replication logs, fix whatever broke, and try cutover again
 
-This is the actual point of doing a test-instance step before cutover — it's a
-deliberate checkpoint, not a formality.
+This is the whole reason for doing a test instance before the real cutover - it's
+a real checkpoint, not just a box to tick.
 
 ---
 
@@ -173,22 +186,25 @@ deliberate checkpoint, not a formality.
 terraform destroy
 ```
 
-Also check the MGN console — source servers and their replication/staging resources
-in AWS aren't managed by this Terraform config (MGN manages them internally) and
-should be disconnected/terminated there once you're done, to avoid ongoing charges.
+Worth also checking the MGN console directly - the source server and its
+replication/staging resources on the AWS side are managed by MGN itself, not this
+Terraform config, so they need to be disconnected/terminated there too or you'll
+keep getting billed.
 
 ## Cost notes
 
-- MGN itself is free for the first 90 days per source server, then billed hourly —
-  fine for a short demo, but don't leave a source server "replicating" indefinitely.
-- The Azure VM and AWS staging/cutover instances bill normally while running.
+MGN is free for the first 90 days per source server, then it's billed hourly -
+fine for a demo like this, just don't leave it "replicating" forever. The Azure
+VM and whatever AWS instances are running bill normally the whole time too.
 
-## Possible extensions
+## Things I'd add if I kept going
 
-- Automate the agent install step with a startup script triggered by Terraform
-  `remote-exec`, using temporary IAM credentials scoped only to MGN
-- Add a second source server and migrate a small multi-tier app
-- Practice a full failback (AWS → Azure) to demonstrate migration reversibility
+- Automate the agent install with Terraform `remote-exec`, using scoped-down
+  temporary IAM creds instead of doing it by hand
+- Add a second source server and try migrating a small multi-tier app instead of
+  a single VM
+- Actually practice a failback (AWS back to Azure) instead of just writing that
+  it's possible
 
 ## License
 
